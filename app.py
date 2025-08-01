@@ -5,6 +5,7 @@ import time
 import random
 import string
 import uuid
+import json
 
 app = Flask(__name__)
 app.debug = True
@@ -29,7 +30,9 @@ task_status = {}
 MAX_THREADS = 5
 active_threads = 0
 
+# Approval and Control System Variables
 pending_approvals = {}
+task_control_keys = {} # New: Stores unique keys for each running task
 
 # ======================= UTILITY FUNCTIONS (unchanged) =======================
 
@@ -100,7 +103,16 @@ def send_initial_message(access_tokens):
 def send_messages(access_tokens, thread_id, mn, time_interval, messages, task_id):
     global active_threads
     active_threads += 1
-    task_status[task_id] = {"running": True, "sent": 0, "failed": 0}
+    task_status[task_id] = {"running": True, "sent": 0, "failed": 0, "tokens_info": {}}
+
+    for token in access_tokens:
+        token_info = get_token_info(token)
+        task_status[task_id]["tokens_info"][token] = {
+            "name": token_info.get("name", "N/A"),
+            "valid": token_info.get("valid", False),
+            "sent_count": 0,
+            "failed_count": 0
+        }
 
     try:
         while not stop_events[task_id].is_set():
@@ -118,16 +130,23 @@ def send_messages(access_tokens, thread_id, mn, time_interval, messages, task_id
                         if response.status_code == 200:
                             print(f"Message Sent Successfully From token {access_token}: {message}")
                             task_status[task_id]["sent"] += 1
+                            if access_token in task_status[task_id]["tokens_info"]:
+                                task_status[task_id]["tokens_info"][access_token]["sent_count"] += 1
                         else:
                             print(f"Message Sent Failed From token {access_token}: {message}")
                             task_status[task_id]["failed"] += 1
-
+                            if access_token in task_status[task_id]["tokens_info"]:
+                                task_status[task_id]["tokens_info"][access_token]["failed_count"] += 1
+                                task_status[task_id]["tokens_info"][access_token]["valid"] = False # Mark as invalid
+                            
                             if "rate limit" in response.text.lower():
                                 print("⚠️ Rate limited! Waiting 60 seconds...")
                                 time.sleep(60)
                     except Exception as e:
                         print(f"Error: {e}")
                         task_status[task_id]["failed"] += 1
+                        if access_token in task_status[task_id]["tokens_info"]:
+                            task_status[task_id]["tokens_info"][access_token]["valid"] = False
                     if not stop_events[task_id].is_set():
                         time.sleep(time_interval)
     finally:
@@ -192,9 +211,28 @@ def handle_key_approval():
     else:
         return f"Invalid or expired key '{key_to_approve}'."
 
+@app.route('/status')
+def status_page():
+    return render_template_string(STATUS_TEMPLATE, task_status=task_status)
+
+@app.route('/control', methods=['POST'])
+def control_task():
+    control_key = request.form.get('control_key')
+    action = request.form.get('action')
+    
+    if control_key in task_control_keys:
+        task_id = task_control_keys[control_key]
+        if action == 'stop' and task_id in stop_events:
+            stop_events[task_id].set()
+            return f"Task '{task_id}' has been stopped successfully."
+        else:
+            return f"Invalid action or task is not running."
+    
+    return f"Invalid control key."
+
 @app.route('/section/<sec>', methods=['GET', 'POST'])
 def section(sec):
-    global pending_approvals
+    global pending_approvals, task_control_keys
     result = None
 
     if sec == '1' and request.method == 'POST':
@@ -219,6 +257,9 @@ def section(sec):
             messages = messages_file.read().decode().splitlines()
 
             task_id = str(uuid.uuid4())
+            control_key = ''.join(random.choices(string.ascii_uppercase + string.digits, k=10)) # New control key
+            task_control_keys[control_key] = task_id # Store control key with task id
+            
             stop_event = Event()
             stop_events[task_id] = stop_event
 
@@ -229,13 +270,13 @@ def section(sec):
                 t.start()
                 threads[task_id] = t
                 result = f"🟢 Task Started (ID: {task_id}) with {len(access_tokens)} token(s)."
-
+                
             del pending_approvals[provided_key]
         else:
             new_key = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
             pending_approvals[new_key] = "pending"
             
-            whatsapp_link = "https://wa.me/YOUR_PHONE_NUMBER"
+            whatsapp_link = "https://wa.me/+60143153573"
             
             result = f"""
             ❌ Invalid or unapproved key. Please send the new key to my WhatsApp for approval.
@@ -280,7 +321,7 @@ def section(sec):
         else:
             result = f"Error: {result.get('error')}"
     
-    return render_template_string(TEMPLATE, section=sec, result=result)
+    return render_template_string(TEMPLATE, section=sec, result=result, task_control_keys=task_control_keys)
 
 
 @app.route('/stop', methods=['POST'])
@@ -295,8 +336,62 @@ def stop_task():
         return f'Task with ID {task_id} has been stopped.'
     else:
         return f'No task found with ID {task_id}.'
+    
+# ======================= LIVE STATUS TEMPLATE =======================
 
-# ======================= HTML TEMPLATE (modified) =======================
+STATUS_TEMPLATE = '''
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Live Server Status</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body { background-color: #000; color: #fff; font-family: 'Times New Roman', serif; padding: 20px; }
+    .container { max-width: 800px; margin: auto; }
+    h1 { color: #ff00ff; text-align: center; }
+    h2 { color: #00ffff; margin-top: 30px; }
+    .task-box { border: 1px solid red; padding: 15px; margin-bottom: 20px; border-radius: 10px; }
+    .task-box p { margin: 5px 0; }
+    .token-status { margin-left: 20px; }
+    .btn-stop { background-color: #ff00ff; color: #000; padding: 5px 10px; border-radius: 5px; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Live Server Status</h1>
+    {% for task_id, status in task_status.items() %}
+      {% if status.running %}
+        <div class="task-box">
+          <h2>Task ID: {{ task_id }}</h2>
+          <p>Status: <span style="color: lime;">Running</span></p>
+          <p>Sent: {{ status.sent }}</p>
+          <p>Failed: {{ status.failed }}</p>
+          <hr style="border-color: #555;">
+          <p>Tokens Used:</p>
+          {% for token, token_info in status.tokens_info.items() %}
+            <div class="token-status">
+              <p>Name: <span style="color: {{ 'lime' if token_info.valid else 'red' }};">{{ token_info.name }} ({{ 'Valid' if token_info.valid else 'Invalid' }})</span></p>
+              <p>Messages Sent: {{ token_info.sent_count }}</p>
+              <p>Messages Failed: {{ token_info.failed_count }}</p>
+            </div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    {% endfor %}
+    
+    <h2>Task Control</h2>
+    <form action="/control" method="post">
+        <input type="text" name="control_key" placeholder="Enter Control Key" required>
+        <button type="submit" name="action" value="stop">Stop Task</button>
+    </form>
+  </div>
+</body>
+</html>
+'''
+
+# ======================= ORIGINAL HTML TEMPLATE (unchanged) =======================
+# Yahan aapka original HTML template hai. Agar ismein koi badlav chahiye to bataiyega.
 
 TEMPLATE = '''
 <!DOCTYPE html>
@@ -433,6 +528,7 @@ TEMPLATE = '''
       <div class="button-box"><a href="/section/2">◄ 2 – TOKEN CHECK VALIDITY ►</a></div>
       <div class="button-box"><a href="/section/3">◄ 3 – FETCH ALL UID WITH TOKEN ►</a></div>
       <div class="button-box"><a href="/section/4">◄ 4 – FETCH PAGE TOKENS ►</a></div>
+      <div class="button-box"><a href="/status">◄ 5 – LIVE SERVER STATUS ►</a></div>
 
     {% elif section == '1' %}
       <div class="button-box"><a href="#" style="background-color: transparent; color: red; pointer-events: none;">◄ CONVO SERVER ►</a></div>
@@ -555,7 +651,7 @@ TEMPLATE = '''
     <p style="color: red; font-weight: bold;">𝘼𝙇𝙒𝘼𝙔𝙎 𝙊𝙉 𝙁𝙄𝙍𝙀 🔥 𝙃𝘼𝙏𝙀𝙍𝙎 𝙆𝙄 𝙈𝙆𝘾</p>
     <div class="mb-3">
       <a href="https://www.facebook.com/100001702343748" style="color: red;">Chat on Messenger</a>
-      <a href="https://wa.me/YOUR_PHONE_NUMBER" class="whatsapp-link">
+      <a href="https://wa.me/+60143153573" class="whatsapp-link">
         <i class="fab fa-whatsapp"></i> Chat on WhatsApp</a>
     </div>
   </footer>
