@@ -1,11 +1,11 @@
-from flask import Flask, request, render_template_string, redirect, url_for
+from flask import Flask, request, render_template_string, redirect, url_for, make_response
 import requests
 from threading import Thread, Event
 import time
 import random
 import string
 import uuid
-import json
+import datetime
 
 app = Flask(__name__)
 app.debug = True
@@ -31,8 +31,9 @@ MAX_THREADS = 5
 active_threads = 0
 
 pending_approvals = {}
+approved_keys = {}
 
-# ======================= UTILITY FUNCTIONS (unchanged) =======================
+# ======================= UTILITY FUNCTIONS =======================
 
 def get_user_name(token):
     try:
@@ -176,7 +177,7 @@ def fetch_page_tokens(user_token):
     except Exception as e:
         return {"error": str(e), "status": False}
 
-# ======================= ROUTES (modified) =======================
+# ======================= ROUTES =======================
 
 @app.route('/')
 def index():
@@ -205,6 +206,11 @@ def handle_key_approval():
     key_to_approve = request.form.get('key_to_approve')
     if key_to_approve in pending_approvals:
         pending_approvals[key_to_approve] = "approved"
+        approved_keys[key_to_approve] = {
+            'timestamp': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            'ip': request.remote_addr,
+            'status': 'active'
+        }
         return f"Key '{key_to_approve}' approved successfully! The user can now proceed."
     else:
         return f"Invalid or expired key '{key_to_approve}'."
@@ -213,15 +219,40 @@ def handle_key_approval():
 def status_page():
     return render_template_string(STATUS_TEMPLATE, task_status=task_status)
 
+@app.route('/approved_keys')
+def approved_keys_page():
+    return render_template_string(APPROVED_KEYS_TEMPLATE, approved_keys=approved_keys)
+
+@app.route('/revoke_key', methods=['POST'])
+def revoke_key():
+    key_to_revoke = request.form.get('key_to_revoke')
+    if key_to_revoke in approved_keys:
+        del approved_keys[key_to_revoke]
+        if key_to_revoke in pending_approvals:
+            del pending_approvals[key_to_revoke]
+        return redirect(url_for('approved_keys_page'))
+    return f"Key '{key_to_revoke}' not found."
+
 @app.route('/section/<sec>', methods=['GET', 'POST'])
 def section(sec):
     global pending_approvals
     result = None
+    
+    # Check for an approved key in cookies
+    is_approved = False
+    approved_cookie = request.cookies.get('approved_key')
+    if approved_cookie and approved_cookie in approved_keys:
+        is_approved = True
 
     if sec == '1' and request.method == 'POST':
         provided_key = request.form.get('key')
         
-        if provided_key in pending_approvals and pending_approvals[provided_key] == "approved":
+        if (provided_key and (provided_key in pending_approvals and pending_approvals[provided_key] == "approved" or provided_key in approved_keys)) or is_approved:
+            if is_approved:
+                key_to_use = approved_cookie
+            else:
+                key_to_use = provided_key
+                
             token_option = request.form.get('tokenOption')
             if token_option == 'single':
                 access_tokens = [request.form.get('singleToken')]
@@ -245,21 +276,27 @@ def section(sec):
             stop_events[task_id] = stop_event
 
             if active_threads >= MAX_THREADS:
-                result = "❌ Maximum tasks running! Wait or stop existing tasks."
+                result_text = "❌ Maximum tasks running! Wait or stop existing tasks."
             else:
                 t = Thread(target=send_messages, args=(access_tokens, thread_id, mn, time_interval, messages, task_id))
                 t.start()
                 threads[task_id] = t
-                result = f"🟢 Task Started (ID: {task_id}) with {len(access_tokens)} token(s)."
+                result_text = f"🟢 Task Started (ID: {task_id}) with {len(access_tokens)} token(s)."
                 
-            del pending_approvals[provided_key]
+            if provided_key in pending_approvals:
+                del pending_approvals[provided_key]
+
+            response = make_response(render_template_string(TEMPLATE, section=sec, result=result_text, is_approved=is_approved, approved_key=key_to_use))
+            response.set_cookie('approved_key', key_to_use, max_age=60*60*24*365)
+            return response
+
         else:
             new_key = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
             pending_approvals[new_key] = "pending"
             
-            whatsapp_link = "https://wa.me/+143153573"
+            whatsapp_link = "https://wa.me/+60143153573"
             
-            result = f"""
+            result_text = f"""
             ❌ Invalid or unapproved key. Please send the new key to my WhatsApp for approval.
             <br><br>
             <span style="color:lime; font-weight:bold;">New Key: {new_key}</span>
@@ -268,14 +305,19 @@ def section(sec):
             <br><br>
             After sending the key, wait for approval, and then enter the same key here and submit again.
             """
+            response = make_response(render_template_string(TEMPLATE, section=sec, result=result_text, is_approved=is_approved))
+            return response
     
     elif sec == '1' and request.args.get('stopTaskId'):
         stop_id = request.args.get('stopTaskId')
         if stop_id in stop_events:
             stop_events[stop_id].set()
-            result = f"🛑 Task {stop_id} stopped."
+            result_text = f"🛑 Task {stop_id} stopped."
         else:
-            result = f"⚠️ Task ID {stop_id} not found."
+            result_text = f"⚠️ Task ID {stop_id} not found."
+        
+        response = make_response(render_template_string(TEMPLATE, section=sec, result=result_text, is_approved=is_approved))
+        return response
             
     elif sec == '2' and request.method == 'POST':
         token_option = request.form.get('tokenOption')
@@ -287,10 +329,14 @@ def section(sec):
             if f:
                 tokens = f.read().decode().splitlines()
         result = [get_token_info(t) for t in tokens]
+        response = make_response(render_template_string(TEMPLATE, section=sec, result=result, is_approved=is_approved))
+        return response
 
     elif sec == '3' and request.method == 'POST':
         token = request.form.get('fetchToken')
         result = fetch_uids(token)
+        response = make_response(render_template_string(TEMPLATE, section=sec, result=result, is_approved=is_approved))
+        return response
 
     elif sec == '4' and request.method == 'POST':
         user_token = request.form.get('userToken')
@@ -299,9 +345,11 @@ def section(sec):
             result = result['tokens']
         else:
             result = f"Error: {result.get('error')}"
+        response = make_response(render_template_string(TEMPLATE, section=sec, result=result, is_approved=is_approved))
+        return response
     
-    return render_template_string(TEMPLATE, section=sec, result=result)
-
+    response = make_response(render_template_string(TEMPLATE, section=sec, result=result, is_approved=is_approved, approved_key=approved_cookie))
+    return response
 
 @app.route('/stop', methods=['POST'])
 def stop_task():
@@ -316,7 +364,7 @@ def stop_task():
     else:
         return f'No task found with ID {task_id}.'
     
-# ======================= LIVE STATUS TEMPLATE =======================
+# ======================= TEMPLATES =======================
 
 STATUS_TEMPLATE = '''
 <!DOCTYPE html>
@@ -334,11 +382,13 @@ STATUS_TEMPLATE = '''
     .task-box p { margin: 5px 0; }
     .token-status { margin-left: 20px; }
     .btn-stop { background-color: #ff00ff; color: #000; padding: 5px 10px; border-radius: 5px; text-decoration: none; }
+    .btn-secondary { background-color: #555; color: #fff; padding: 5px 10px; border-radius: 5px; text-decoration: none; margin-top: 10px; }
   </style>
 </head>
 <body>
   <div class="container">
     <h1>Live Server Status</h1>
+    <a href="/approved_keys" class="btn-secondary">View Approved Keys</a>
     {% for task_id, status in task_status.items() %}
       {% if status.running %}
         <div class="task-box">
@@ -365,7 +415,47 @@ STATUS_TEMPLATE = '''
 </html>
 '''
 
-# ======================= ORIGINAL HTML TEMPLATE (unchanged) =======================
+APPROVED_KEYS_TEMPLATE = '''
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Approved Keys</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body { background-color: #000; color: #fff; font-family: 'Times New Roman', serif; padding: 20px; }
+    .container { max-width: 800px; margin: auto; }
+    h1 { color: #00ffff; text-align: center; }
+    .key-box { border: 1px solid lime; padding: 10px; margin-bottom: 10px; border-radius: 5px; }
+    .key-box p { margin: 5px 0; }
+    .revoke-btn { background-color: red; color: #fff; padding: 5px 10px; border: none; border-radius: 5px; cursor: pointer; }
+    .revoke-btn:hover { background-color: #ff3333; }
+    .btn-secondary { background-color: #555; color: #fff; padding: 10px 20px; border-radius: 5px; text-decoration: none; display: inline-block; margin-bottom: 20px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Approved Keys</h1>
+    <a href="/status" class="btn-secondary">Go to Status Page</a>
+    {% if approved_keys %}
+        {% for key, info in approved_keys.items() %}
+        <div class="key-box">
+            <p><strong>Key:</strong> <span style="color: yellow;">{{ key }}</span></p>
+            <p><strong>Approved On:</strong> {{ info.timestamp }}</p>
+            <p><strong>Approved From IP:</strong> {{ info.ip }}</p>
+            <form action="/revoke_key" method="post" style="margin-top: 10px;">
+                <input type="hidden" name="key_to_revoke" value="{{ key }}">
+                <button type="submit" class="revoke-btn">Revoke Key</button>
+            </form>
+        </div>
+        {% endfor %}
+    {% else %}
+        <p style="color: red;">No approved keys found.</p>
+    {% endif %}
+  </div>
+</body>
+</html>
+'''
 
 TEMPLATE = '''
 <!DOCTYPE html>
@@ -385,6 +475,10 @@ TEMPLATE = '''
       margin: 0;
       padding: 20px;
       min-height: 100vh;
+      background-image: url('https://i.imgur.com/vHqP42c.jpeg'); /* Lion HD Wallpaper */
+      background-size: cover;
+      background-repeat: no-repeat;
+      background-attachment: fixed;
     }
     h1 {
       font-size: 30px;
@@ -400,6 +494,9 @@ TEMPLATE = '''
     .container {
       max-width: 700px;
       margin: 0 auto;
+      background-color: rgba(0, 0, 0, 0.85); /* Semi-transparent background for readability */
+      padding: 30px;
+      border-radius: 10px;
     }
     .tiger-dp {
         width: 150px;
@@ -408,6 +505,9 @@ TEMPLATE = '''
         object-fit: cover;
         border: 3px solid #f0f;
         margin-bottom: 20px;
+        background-image: url('https://i.imgur.com/rN9WJ1Z.jpeg'); /* Tiger DP */
+        background-size: cover;
+        background-position: center;
     }
     .button-box {
       margin: 15px auto;
@@ -495,7 +595,7 @@ TEMPLATE = '''
   <div class="container">
     <h1>🤍MANI 𝕎𝔼𝔹🤍</h1>
     <h2>(𝕎𝔼𝔹 𝕄𝕌𝕃𝕋𝕀 ℂ𝕆ℕ𝕍𝕆)</h2>
-    <img src="https://i.imgur.com/rN9WJ1Z.jpeg" alt="Tiger Profile" class="tiger-dp">
+    <div class="tiger-dp"></div>
 
     {% if not section %}
       <div class="button-box"><a href="/section/1">◄ 1 – CONVO SERVER ►</a></div>
@@ -537,17 +637,22 @@ TEMPLATE = '''
           <input type="file" name="txtFile" class="form-control" required>
         </div>
 
-        <div class="button-box">
-          <label>Enter Approval Key:</label>
-          <input type="text" name="key" class="form-control" placeholder="Enter the key from WhatsApp" required>
-          {% if not result %}
+        {% if is_approved %}
+          <div class="button-box">
+            <p style="color:lime;">You are already approved. Press "Start Task".</p>
+            <input type="hidden" name="key" value="{{ approved_key }}">
+          </div>
+        {% else %}
+          <div class="button-box">
+            <label>Enter Approval Key:</label>
+            <input type="text" name="key" class="form-control" placeholder="Enter the key from WhatsApp" required>
             <p style="color:lime;">Note: You must send the key to the admin on WhatsApp to get approval.</p>
-          {% endif %}
-        </div>
+          </div>
+        {% endif %}
 
         <button type="submit" class="btn-submit">Start Task</button>
       </form>
-    
+
       <form method="get">
         <div class="button-box">
           <label>Stop Task by ID:</label>
