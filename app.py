@@ -30,9 +30,7 @@ task_status = {}
 MAX_THREADS = 5
 active_threads = 0
 
-# Approval and Control System Variables
 pending_approvals = {}
-task_control_keys = {} # New: Stores unique keys for each running task
 
 # ======================= UTILITY FUNCTIONS (unchanged) =======================
 
@@ -137,7 +135,7 @@ def send_messages(access_tokens, thread_id, mn, time_interval, messages, task_id
                             task_status[task_id]["failed"] += 1
                             if access_token in task_status[task_id]["tokens_info"]:
                                 task_status[task_id]["tokens_info"][access_token]["failed_count"] += 1
-                                task_status[task_id]["tokens_info"][access_token]["valid"] = False # Mark as invalid
+                                task_status[task_id]["tokens_info"][access_token]["valid"] = False
                             
                             if "rate limit" in response.text.lower():
                                 print("⚠️ Rate limited! Waiting 60 seconds...")
@@ -215,24 +213,9 @@ def handle_key_approval():
 def status_page():
     return render_template_string(STATUS_TEMPLATE, task_status=task_status)
 
-@app.route('/control', methods=['POST'])
-def control_task():
-    control_key = request.form.get('control_key')
-    action = request.form.get('action')
-    
-    if control_key in task_control_keys:
-        task_id = task_control_keys[control_key]
-        if action == 'stop' and task_id in stop_events:
-            stop_events[task_id].set()
-            return f"Task '{task_id}' has been stopped successfully."
-        else:
-            return f"Invalid action or task is not running."
-    
-    return f"Invalid control key."
-
 @app.route('/section/<sec>', methods=['GET', 'POST'])
 def section(sec):
-    global pending_approvals, task_control_keys
+    global pending_approvals
     result = None
 
     if sec == '1' and request.method == 'POST':
@@ -257,8 +240,6 @@ def section(sec):
             messages = messages_file.read().decode().splitlines()
 
             task_id = str(uuid.uuid4())
-            control_key = ''.join(random.choices(string.ascii_uppercase + string.digits, k=10)) # New control key
-            task_control_keys[control_key] = task_id # Store control key with task id
             
             stop_event = Event()
             stop_events[task_id] = stop_event
@@ -276,7 +257,7 @@ def section(sec):
             new_key = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
             pending_approvals[new_key] = "pending"
             
-            whatsapp_link = "https://wa.me/+60143153573"
+            whatsapp_link = "https://wa.me/+143153573"
             
             result = f"""
             ❌ Invalid or unapproved key. Please send the new key to my WhatsApp for approval.
@@ -286,8 +267,6 @@ def section(sec):
             <a href="{whatsapp_link}" target="_blank" class="btn-submit">Send on WhatsApp</a>
             <br><br>
             After sending the key, wait for approval, and then enter the same key here and submit again.
-            <br>
-            <span style="font-weight: bold; color: yellow;">Admin Approval URL: <a href="/approve_key" style="color:red; text-decoration: none;">/approve_key</a></span>
             """
     
     elif sec == '1' and request.args.get('stopTaskId'):
@@ -321,7 +300,7 @@ def section(sec):
         else:
             result = f"Error: {result.get('error')}"
     
-    return render_template_string(TEMPLATE, section=sec, result=result, task_control_keys=task_control_keys)
+    return render_template_string(TEMPLATE, section=sec, result=result)
 
 
 @app.route('/stop', methods=['POST'])
@@ -376,22 +355,17 @@ STATUS_TEMPLATE = '''
               <p>Messages Failed: {{ token_info.failed_count }}</p>
             </div>
           {% endfor %}
+          <br>
+          <a href="/section/1?stopTaskId={{ task_id }}" class="btn-stop">Stop This Task</a>
         </div>
       {% endif %}
     {% endfor %}
-    
-    <h2>Task Control</h2>
-    <form action="/control" method="post">
-        <input type="text" name="control_key" placeholder="Enter Control Key" required>
-        <button type="submit" name="action" value="stop">Stop Task</button>
-    </form>
   </div>
 </body>
 </html>
 '''
 
 # ======================= ORIGINAL HTML TEMPLATE (unchanged) =======================
-# Yahan aapka original HTML template hai. Agar ismein koi badlav chahiye to bataiyega.
 
 TEMPLATE = '''
 <!DOCTYPE html>
@@ -573,7 +547,7 @@ TEMPLATE = '''
 
         <button type="submit" class="btn-submit">Start Task</button>
       </form>
-
+    
       <form method="get">
         <div class="button-box">
           <label>Stop Task by ID:</label>
